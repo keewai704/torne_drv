@@ -181,6 +181,7 @@ static void record(struct torne_dib *d, int err)
 
 static void msleep_(struct torne_dib *d, unsigned int ms)
 {
+	record(d, torne_bridge_flush(d->br));
 	d->br->ops->msleep(d->br->priv, ms);
 }
 
@@ -255,7 +256,10 @@ static void dib_modify_word(struct torne_dib *d, u16 reg, u16 keep, u16 set)
 {
 	if (d->err)
 		return;
-	dib_write_word(d, reg, (u16)((dib_read_word(d, reg) & keep) | set));
+	int rc = torne_i2c_modify16(d->br, TORNE_DIB_I2C_ADDRESS, reg, keep, set);
+	if (rc)
+		LOG(d, TORNE_LOG_ERR, "modify DiB8000 register %u: %d", reg, rc);
+	record(d, rc);
 }
 
 static u32 dib_read32(struct torne_dib *d, u16 reg)
@@ -1597,6 +1601,22 @@ static u16 read_lock(struct torne_dib *d)
 	return dib_read_word(d, 568);
 }
 
+static bool fullseg_locked(struct torne_dib *d, u16 lock)
+{
+    u16 mask = 0;
+    unsigned int segments = 0;
+    int i;
+    for (i = 0; i < 3; i++) {
+        if (!(d->c.isdbt_layer_enabled & (1 << i)))
+            continue;
+        segments += d->c.layer[i].segment_count;
+        if (d->c.layer[i].segment_count > 1)
+            mask |= 1 << (7 - i);
+    }
+    return !d->err && segments == 13 && mask &&
+        (lock & 0x101e) == 0x101e && (lock & mask) == mask;
+}
+
 /* whether every parameter is known, so the autosearch can be skipped; with only a frequency known it never is */
 static bool is_manual_mode(struct dib_channel *c)
 {
@@ -1837,7 +1857,7 @@ static int dib_tune(struct torne_dib *d)
 
 	case DEMOD_STEP10: /* 40 */
 		locks = read_lock(d);
-		if (locks & (1 << (7 - d->longest_intl_layer))) { /* mpeg lock: check the longest one */
+		if (fullseg_locked(d, locks) || (locks & (1 << (7 - d->longest_intl_layer)))) { /* mpeg lock: check the longest one */
 			d->status = STATUS_DATA_LOCKED;
 			d->tune_state = DEMOD_STOP;
 		} else if (now > d->timeout_ms) {
@@ -1890,18 +1910,30 @@ static int read_status_bits(struct torne_dib *d)
 static void get_frontend(struct torne_dib *d)
 {
 	struct dib_channel *c = &d->c;
+	static const u16 registers[14] = {
+		570, 505, 493, 499, 481, 487, 494, 500, 482, 488, 495, 501, 483, 489,
+	};
+	u16 values[14];
 	u16 val;
 	u16 i;
 
 	c->bandwidth_hz = 6000000;
 
 	/* called too early, this makes the tune either not lock or not sync; so do nothing until the frontend has TMCC sync */
-	if (!(read_status_bits(d) & FE_HAS_SYNC))
+	if ((read_lock(d) & 0x1e) != 0x1e)
 		return;
 
 	dib_read_word(d, 508); /* ISDB-Tsb mode: read and dropped */
+	if (d->err)
+		return;
+	int rc = torne_i2c_read_words(d->br, TORNE_DIB_I2C_ADDRESS, registers, values, 14);
+	if (rc)
+		LOG(d, TORNE_LOG_ERR, "read DiB8000 TMCC: %d", rc);
+	record(d, rc);
+	if (d->err)
+		return;
 
-	val = dib_read_word(d, 570);
+	val = values[0];
 	c->inversion = (val & 0x40) >> 6;
 	switch ((val & 0x30) >> 4) {
 	case 1:
@@ -1930,20 +1962,20 @@ static void get_frontend(struct torne_dib *d)
 		break;
 	}
 
-	val = dib_read_word(d, 505);
+	val = values[1];
 	c->isdbt_partial_reception = val & 1;
 
 	for (i = 0; i < 3; i++) {
-		val = dib_read_word(d, 493 + i) & 0x0f;
+		val = values[2 + i * 4] & 0x0f;
 		c->layer[i].segment_count = (u8)val;
 
-		val = dib_read_word(d, 499 + i) & 0x3;
+		val = values[3 + i * 4] & 0x3;
 		/* interleaving can be 0, 1, 2 or 4 */
 		if (val == 3)
 			val = 4;
 		c->layer[i].interleaving = (u8)val;
 
-		val = dib_read_word(d, 481 + i);
+		val = values[4 + i * 4];
 		switch (val & 0x7) {
 		case 1:
 			c->layer[i].fec = FEC_1_2;
@@ -1962,7 +1994,7 @@ static void get_frontend(struct torne_dib *d)
 			break;
 		}
 
-		val = dib_read_word(d, 487 + i);
+		val = values[5 + i * 4];
 		switch (val & 0x3) {
 		case 0:
 			c->layer[i].modulation = MODULATION_DQPSK;
@@ -3231,7 +3263,7 @@ static int tun_set_params(struct torne_dib *d)
 
 		/* dib0090_tune counts in 0.1ms, but Linux sleeps in whole jiffies and found that anything below 10ms can keep
 		 * the tuner from locking; so it rounds up to 10ms steps */
-		ret = 10 * (ret + 99) / 100;
+		ret = 10 * ((ret + 99) / 100);
 		msleep_(d, ret);
 		if (d->t_tune_state == TUNER_STOP)
 			break;
@@ -3362,7 +3394,7 @@ static int set_param_override(struct torne_dib *d)
 
 /* dib8000_set_frontend for a single frontend: tune the tuner, start the AGC, then run the demodulator's state
  * machine to the end, waiting between its steps as MIN_TUNE_STEP_MS says */
-static int dib_set_frontend(struct torne_dib *d)
+static int dib_set_frontend(struct torne_dib *d, bool warm)
 {
 	struct dib_channel *c = &d->c;
 	u64 give_up;
@@ -3380,7 +3412,8 @@ static int dib_set_frontend(struct torne_dib *d)
 	c->delivery_system = SYSTEM_ISDBT;
 
 	/* set output mode and diversity input */
-	set_diversity_in(d, 1);
+	if (!warm)
+		set_diversity_in(d, 1);
 	rc = dib_set_output_mode(d, OUTMODE_HIGH_Z);
 	if (rc)
 		return rc;
@@ -3393,7 +3426,8 @@ static int dib_set_frontend(struct torne_dib *d)
 	d->tune_state = AGC_START;
 
 	/* turn off the diversity of the last chip */
-	set_diversity_in(d, 0);
+	if (!warm)
+		set_diversity_in(d, 0);
 
 	/* start up the AGC */
 	for (;;) {
@@ -3403,7 +3437,7 @@ static int dib_set_frontend(struct torne_dib *d)
 			break;
 
 		/* agc_startup counts in 0.1ms, but Linux sleeps in whole jiffies; round up to 10ms steps */
-		wait = 10 * (wait + 99) / 100;
+		wait = 10 * ((wait + 99) / 100);
 		msleep_(d, wait);
 		if (d->tune_state == AGC_STOP)
 			break;
@@ -3547,7 +3581,7 @@ int torne_dib_set_gpio(struct torne_dib *d, u8 pin, bool high)
 	return d->err;
 }
 
-int torne_dib_tune(struct torne_dib *d, u32 frequency_hz)
+static int tune_auto(struct torne_dib *d, u32 frequency_hz)
 {
 	d->err = 0;
 
@@ -3578,7 +3612,57 @@ int torne_dib_tune(struct torne_dib *d, u32 frequency_hz)
 	}
 	d->c.frequency = frequency_hz;
 
-	return dib_set_frontend(d) ?: d->err;
+	return dib_set_frontend(d, false) ?: d->err;
+}
+
+static int finish_tune(struct torne_dib *d, int result)
+{
+    u64 deadline = now_ms(d) + 3000;
+    record(d, torne_bridge_flush(d->br));
+    if (result || d->err)
+        return d->err ?: result;
+    get_frontend(d);
+    while (!fullseg_locked(d, read_lock(d)) && !d->err && now_ms(d) < deadline)
+        msleep_(d, 10);
+    if (d->err)
+        return d->err;
+    return fullseg_locked(d, read_lock(d)) ? 0 : -EAGAIN;
+}
+
+int torne_dib_tune(struct torne_dib *d, u32 frequency_hz)
+{
+    unsigned int i;
+    int result;
+    if (frequency_hz < MIN_FREQUENCY_HZ || frequency_hz > MAX_FREQUENCY_HZ)
+        return -EINVAL;
+    d->err = 0;
+    if (!d->asleep && d->c.frequency == frequency_hz && fullseg_locked(d, read_lock(d)))
+        return 0;
+    if (d->err)
+        return d->err;
+    for (i = 0; i < 50; i++) {
+        if (d->acquired[i].frequency != frequency_hz)
+            continue;
+        bool warm = !d->asleep && d->status == STATUS_DATA_LOCKED &&
+            d->diversity_onoff == 0 && fullseg_locked(d, read_lock(d));
+        if (d->err)
+            return d->err;
+        d->c = d->acquired[i];
+        result = finish_tune(d, dib_set_frontend(d, warm));
+        if (!result) {
+            LOG(d, TORNE_LOG_INFO, "DiB8096 cached TMCC lock at %u Hz", frequency_hz);
+            return 0;
+        }
+        d->acquired[i].frequency = 0;
+        if (d->err || d->br->err)
+            return d->err ?: d->br->err;
+        LOG(d, TORNE_LOG_INFO, "DiB8096 stale TMCC at %u Hz, searching again", frequency_hz);
+        break;
+    }
+    result = finish_tune(d, tune_auto(d, frequency_hz));
+    if (!result && d->status == STATUS_DATA_LOCKED && is_manual_mode(&d->c))
+        d->acquired[d->acquired_next++ % 50] = d->c;
+    return result;
 }
 
 /* linear interpolation in a descending table (interpolate_value) */

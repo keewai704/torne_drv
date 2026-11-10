@@ -136,6 +136,8 @@ struct torne_dib {
 	struct torne_bridge *br;
 	int err; /* first bus error of an operation; later accesses are skipped */
 	struct dib_channel c;
+	struct dib_channel acquired[50];
+	unsigned int acquired_next;
 	bool asleep;
 
 	/* ---- demodulator (struct dib8000_state) ---- */

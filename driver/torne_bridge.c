@@ -10,9 +10,6 @@
  * cores (FR30 CPUs) are started with small programs (I2C master, stream
  * packetizer), and the TS engine feeds the demodulator's parallel output into
  * an SDRAM ring that core 0 sends to bulk endpoint 0x81 in 192-byte units.
- *
- * Not ported (performance only): the register ring and the bulk command
- * channel of codec core 1. Every I2C access goes through the mailbox.
  */
 #include "torne_core.h"
 #include "torne_regs.h"
@@ -178,14 +175,22 @@ static void write_block(struct torne_bridge *b, u32 address, const u8 *buf, unsi
 	}
 }
 
+static u32 command_memory_read(struct torne_bridge *b, u32 address);
+static void command_memory_write(struct torne_bridge *b, u32 address, u32 value);
+
 u32 torne_mem_read32(struct torne_bridge *b, u32 address)
 {
+	if (b->command_enabled)
+		return command_memory_read(b, address);
 	return read32(b, address);
 }
 
 void torne_mem_write32(struct torne_bridge *b, u32 address, u32 value)
 {
-	write32(b, address, value);
+	if (b->command_enabled)
+		command_memory_write(b, address, value);
+	else
+		write32(b, address, value);
 }
 
 /* 16-bit registers sit in the high half of their word */
@@ -224,6 +229,126 @@ static void write_words(struct torne_bridge *b, u32 address, const u32 *words, u
 			put_be32(buf + i * 4, words[off + i]);
 		write_block(b, address + off * 4, buf, n * 4);
 	}
+}
+
+
+static int command_send(struct torne_bridge *b, bool answer, u32 *values, unsigned int count)
+{
+    u8 packet[512] = { 0 }, reply[64];
+    u32 sequence = b->command_sequence, status;
+    unsigned int i;
+    int length;
+    u64 deadline;
+
+    if (b->err)
+        return b->err;
+    answer = answer || b->command_slot == 15;
+    if (!answer && !b->command_count)
+        return 0;
+    put_be32(packet, sequence);
+    put_be32(packet + 4, b->command_count | (answer ? 0x80000000u : 0));
+    for (i = 0; i < b->command_count; i++)
+        put_be32(packet + 8 + i * 4, b->command_words[i]);
+    put_be32(packet + 508, sequence);
+    b->command_count = 0;
+    length = b->ops->bulk(b->priv, 0x02, packet, sizeof(packet), 500);
+    if (length != sizeof(packet)) {
+        keep_err(b, length < 0 ? length : -EIO);
+        return b->err;
+    }
+    b->command_sequence++;
+    b->command_slot++;
+    if (!answer)
+        return 0;
+    deadline = b->ops->now_ms(b->priv) + 500;
+    for (;;) {
+        length = b->ops->bulk(b->priv, 0x83, reply, sizeof(reply), 500);
+        if (length < 0 && length != -ETIMEDOUT) {
+            keep_err(b, length);
+            return b->err;
+        }
+        if (length >= 8 && be32(reply) == sequence)
+            break;
+        if (b->ops->now_ms(b->priv) >= deadline) {
+            keep_err(b, -ETIMEDOUT);
+            return b->err;
+        }
+    }
+    if (b->command_slot == 16) {
+        b->command_slot = 0;
+        write32(b, 0xfd8508, COMMAND_BASE);
+        write32(b, 0xfd8504, 1);
+    }
+    status = be32(reply + 4);
+    i = status & 0xff;
+    if (i > 14 || 8 + i * 4 > (unsigned int)length || i != count)
+        keep_err(b, -EPROTO);
+    if ((status >> 16) & 0xff)
+        keep_err(b, -EIO);
+    if (!b->err)
+        for (i = 0; i < count; i++)
+            values[i] = be32(reply + 8 + i * 4);
+    return b->err;
+}
+
+static int command_push(struct torne_bridge *b, u32 word)
+{
+    if (b->command_count == 125)
+        command_send(b, false, NULL, 0);
+    if (!b->err)
+        b->command_words[b->command_count++] = word;
+    return b->err;
+}
+
+int torne_bridge_flush(struct torne_bridge *b)
+{
+    if (b->command_enabled && b->command_count)
+        command_send(b, true, NULL, 0);
+    return b->err;
+}
+
+static u32 command_memory_read(struct torne_bridge *b, u32 address)
+{
+    u32 value = 0;
+    if (b->command_count + 2 > 125)
+        command_send(b, false, NULL, 0);
+    command_push(b, 0x48000000u);
+    command_push(b, address);
+    command_send(b, true, &value, 1);
+    return value;
+}
+
+static void command_memory_write(struct torne_bridge *b, u32 address, u32 value)
+{
+    if (b->command_count + 3 > 125)
+        command_send(b, false, NULL, 0);
+    command_push(b, 0x08000000u);
+    command_push(b, address);
+    command_push(b, value);
+}
+
+static int command_setup(struct torne_bridge *b)
+{
+    u8 stale[64];
+    unsigned int i;
+    write32(b, CORE1_BASE + RING_ADDRESSES, 0x12c00000);
+    write32(b, 0xfd8300, 1);
+    write32(b, 0xfd8304, 0x00008004);
+    set32(b, 0xfdbc14, 0x00040000);
+    set32(b, 0xfd80b4, 4);
+    write32(b, 0xfd8510, 512);
+    write32(b, 0xfd8508, COMMAND_BASE);
+    write32(b, 0xfd8504, 1);
+    if (b->err)
+        return b->err;
+    for (i = 0; i < 8; i++)
+        if (b->ops->bulk(b->priv, 0x83, stale, sizeof(stale), 5) <= 0)
+            break;
+    b->command_enabled = true;
+    if (command_send(b, true, NULL, 0))
+        return b->err;
+    LOG(b, TORNE_LOG_INFO, "MB86H47A bulk register commands enabled");
+    return 0;
 }
 
 /* ---- widening of the memory request ---- */
@@ -464,6 +589,9 @@ static int core1_start(struct torne_bridge *b, u32 seed)
 	write32(b, CORE1_BASE + RING_ANSWER, (u32)(RING_SLOTS - 1) << 24);
 	write32(b, CORE1_BASE, 0xfffcffff);
 	b->sequence = 0;
+	b->command_sequence = seed;
+	b->command_slot = 0;
+	b->command_count = 0;
 	before = read32(b, CORE1_BASE + MAILBOX + MAILBOX_ALIVE);
 	b->ops->msleep(b->priv, 1);
 	after = read32(b, CORE1_BASE + MAILBOX + MAILBOX_ALIVE);
@@ -498,7 +626,8 @@ int torne_bridge_start(struct torne_bridge *b)
 	i2c_init(b);
 	if (b->err)
 		return b->err;
-	return core1_start(b, ((u32)b->ops->now_ms(b->priv) & 0x7fffffff) | 1);
+	err = core1_start(b, ((u32)b->ops->now_ms(b->priv) & 0x7fffffff) | 1);
+	return err ?: command_setup(b);
 }
 
 int torne_bridge_reset_demodulator(struct torne_bridge *b)
@@ -547,6 +676,8 @@ static int i2c_transfer(struct torne_bridge *b, u8 address, const u8 *wdata, uns
 	u64 deadline;
 	int err;
 
+	if (torne_bridge_flush(b))
+		return b->err;
 	if (wlen > I2C_MAX_TRANSFER || rlen > I2C_MAX_TRANSFER) {
 		LOG(b, TORNE_LOG_ERR, "MB86H47A I2C transfer of %u+%u bytes is longer than %d", wlen, rlen,
 		    I2C_MAX_TRANSFER);
@@ -585,7 +716,13 @@ static int i2c_transfer(struct torne_bridge *b, u8 address, const u8 *wdata, uns
 
 int torne_i2c_write(struct torne_bridge *b, u8 address, const u8 *data, unsigned int len)
 {
-	return i2c_transfer(b, address, data, len, NULL, 0);
+    if (b->command_enabled) {
+        if (address == 0x12 && len == 4 && ((u16)data[0] << 8 | data[1]) <= 0x7ff)
+            return command_push(b, (u32)data[0] << 24 | (u32)data[1] << 16 | (u32)data[2] << 8 | data[3]);
+        if (address == 0xc0 && len == 3)
+            return command_push(b, 0x20000000u | (u32)data[0] << 16 | (u32)data[1] << 8 | data[2]);
+    }
+    return i2c_transfer(b, address, data, len, NULL, 0);
 }
 
 int torne_i2c_read(struct torne_bridge *b, u8 address, u8 *data, unsigned int len)
@@ -596,7 +733,77 @@ int torne_i2c_read(struct torne_bridge *b, u8 address, u8 *data, unsigned int le
 int torne_i2c_write_read(struct torne_bridge *b, u8 address, const u8 *wdata, unsigned int wlen, u8 *rdata,
 			 unsigned int rlen)
 {
-	return i2c_transfer(b, address, wdata, wlen, rdata, rlen);
+    if (b->command_enabled && rlen == 2) {
+        u32 word = 0, value;
+        bool supported = false;
+        if (address == 0x12 && wlen == 2 && ((u16)wdata[0] << 8 | wdata[1]) <= 0x7ff) {
+            word = (u32)wdata[0] << 24 | (u32)wdata[1] << 16;
+            supported = true;
+        } else if (address == 0xc0 && wlen == 1) {
+            word = 0x20000000u | (u32)wdata[0] << 16;
+            supported = true;
+        }
+        if (supported) {
+            command_push(b, word | 0x40000000u);
+            if (command_send(b, true, &value, 1))
+                return b->err;
+            rdata[0] = value >> 8;
+            rdata[1] = value;
+            return 0;
+        }
+    }
+    return i2c_transfer(b, address, wdata, wlen, rdata, rlen);
+}
+
+int torne_i2c_modify16(struct torne_bridge *b, u8 address, u16 reg, u16 keep, u16 set)
+{
+    if (b->command_enabled && address == 0x12 && reg <= 0x7ff) {
+        if (b->command_count + 2 > 125)
+            command_send(b, false, NULL, 0);
+        command_push(b, 0x10000000u | (u32)reg << 16 | set);
+        return command_push(b, 0x18000000u | keep);
+    }
+    u8 data[4] = { reg >> 8, reg }, reply[2];
+    int result = torne_i2c_write_read(b, address, data, 2, reply, 2);
+    if (result)
+        return result;
+    u16 value = (((u16)reply[0] << 8 | reply[1]) & keep) | set;
+    data[2] = value >> 8;
+    data[3] = value;
+    return torne_i2c_write(b, address, data, sizeof(data));
+}
+
+int torne_i2c_read_words(struct torne_bridge *b, u8 address, const u16 *registers, u16 *values, unsigned int count)
+{
+    unsigned int i;
+    bool supported = b->command_enabled && address == 0x12;
+    if (count > 14)
+        return -EINVAL;
+    if (!count)
+        return b->err;
+    for (i = 0; i < count; i++)
+        if (registers[i] > 0x7ff)
+            supported = false;
+    if (supported) {
+        u32 reply[14];
+        if (b->command_count + count > 125)
+            command_send(b, false, NULL, 0);
+        for (i = 0; i < count; i++)
+            command_push(b, 0x40000000u | (u32)registers[i] << 16);
+        if (command_send(b, true, reply, count))
+            return b->err;
+        for (i = 0; i < count; i++)
+            values[i] = reply[i];
+        return 0;
+    }
+    for (i = 0; i < count; i++) {
+        u8 data[2] = { registers[i] >> 8, registers[i] }, reply[2];
+        int result = torne_i2c_write_read(b, address, data, 2, reply, 2);
+        if (result)
+            return result;
+        values[i] = (u16)reply[0] << 8 | reply[1];
+    }
+    return 0;
 }
 
 /* ---- stream ---- */
@@ -658,8 +865,10 @@ static void stream_setup(struct torne_bridge *b)
 	write32(b, TORNE_REG_USB_DMA1_CONFIG, 0xb09f2000);
 	write32(b, TORNE_REG_USB_DMA1_CONTROL, 2);
 	/* channel DMA[8] would take what arrives on endpoint 0x02; it stays held */
-	write32(b, TORNE_REG_USB_DMA8_CONTROL, 1);
-	write32(b, TORNE_REG_USB_DMA8_CONFIG, 0x00008004);
+	if (!b->command_enabled) {
+		write32(b, TORNE_REG_USB_DMA8_CONTROL, 1);
+		write32(b, TORNE_REG_USB_DMA8_CONFIG, 0x00008004);
+	}
 	/* USB-core registers take whole words */
 	write32(b, TORNE_REG_USB_EP1_CONTROL, 0x00ff6001); /* EP1 reset */
 	for (i = 0; i < 100 && !b->err && (read32(b, TORNE_REG_USB_EP1_CONTROL) & 1); i++)
@@ -670,6 +879,8 @@ static void stream_setup(struct torne_bridge *b)
 
 int torne_bridge_prepare_stream(struct torne_bridge *b)
 {
+	if (torne_bridge_flush(b))
+		return b->err;
 	b->err = 0;
 	stream_setup(b);
 	return b->err;
@@ -678,6 +889,8 @@ int torne_bridge_prepare_stream(struct torne_bridge *b)
 /* lets the demodulator's output in: the input, its timestamp clock and the ring writer */
 int torne_bridge_start_stream(struct torne_bridge *b)
 {
+	if (torne_bridge_flush(b))
+		return b->err;
 	b->err = 0;
 	write32(b, 0xd01020, 0);
 	write32(b, 0xd01040, 0x03000000); /* input on */
@@ -694,6 +907,8 @@ int torne_bridge_start_stream(struct torne_bridge *b)
 /* holds core 0 and the engine's input, so nothing more reaches the endpoint */
 int torne_bridge_stop_stream(struct torne_bridge *b)
 {
+	if (torne_bridge_flush(b))
+		return b->err;
 	b->streaming = false;
 	b->err = 0;
 	write32(b, CORE0_BASE, 0xffffffff);

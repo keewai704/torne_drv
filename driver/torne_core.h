@@ -60,6 +60,10 @@ struct torne_bridge {
 	void *priv;
 
 	int err;	 /* first error of a sequence of accesses (negative errno) */
+	bool command_enabled;
+	u32 command_sequence;
+	unsigned int command_slot, command_count;
+	u32 command_words[125];
 	u8 sequence;	 /* last mailbox sequence number */
 	bool core0_loaded;
 	bool streaming;
@@ -69,6 +73,7 @@ struct torne_bridge {
 /* ---- bridge (MB86H47A) ---- */
 void torne_bridge_init(struct torne_bridge *b, const struct torne_ops *ops, void *priv);
 int torne_bridge_start(struct torne_bridge *b);
+int torne_bridge_flush(struct torne_bridge *b);
 int torne_bridge_reset_demodulator(struct torne_bridge *b);
 /* raw 32-bit chip memory access (the card slot's UART registers); errors are kept in b->err */
 u32 torne_mem_read32(struct torne_bridge *b, u32 address);
@@ -78,6 +83,8 @@ int torne_i2c_write(struct torne_bridge *b, u8 address, const u8 *data, unsigned
 int torne_i2c_read(struct torne_bridge *b, u8 address, u8 *data, unsigned int len);
 int torne_i2c_write_read(struct torne_bridge *b, u8 address, const u8 *wdata, unsigned int wlen, u8 *rdata,
 			 unsigned int rlen);
+int torne_i2c_modify16(struct torne_bridge *b, u8 address, u16 reg, u16 keep, u16 set);
+int torne_i2c_read_words(struct torne_bridge *b, u8 address, const u16 *registers, u16 *values, unsigned int count);
 /* stream */
 int torne_bridge_prepare_stream(struct torne_bridge *b);
 int torne_bridge_start_stream(struct torne_bridge *b);
