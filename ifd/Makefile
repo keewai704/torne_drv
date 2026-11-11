@@ -3,8 +3,8 @@
 
 CC ?= gcc
 
-libifd_torne.so: ifd_torne.c ../driver/torne_ioctl.h
-	$(CC) -std=gnu17 -shared -fPIC -O2 -Wall -I../driver -I/usr/include/PCSC -o $@ ifd_torne.c
+libifd_torne.so: ifd_torne.c ../receiver/card-socket.h ../driver/torne_ioctl.h
+	$(CC) -std=gnu17 -shared -fPIC -O2 -Wall -I../receiver -I../driver -I/usr/include/PCSC -o $@ ifd_torne.c
 
 clean:
 	rm -f libifd_torne.so

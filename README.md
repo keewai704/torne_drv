@@ -122,6 +122,7 @@ x86-64 だけを確認しています。ARM は未確認です。ほかのカー
 | `driver/` | カーネルモジュール(`torne_kern.c`)、OS に依存しない中核(`torne_bridge.c` `torne_dib.c` `torne_card.c`)、px4_drv の文字デバイス層 |
 | `ifd/` | カードスロット用の pcscd リーダードライバー |
 | `packaging/` | Debian パッケージを作るスクリプト |
+| `receiver/` | 同じ中核を libusb で動かす常駐プロセス(`torne-receiver`)。選局とカードスロットを Unix ソケットで提供し、`ifd/` はこのソケットに接続します |
 | `tools/` | `torne_user`(同じ中核を libusb でユーザー空間から動かす試験ツール)、試験スクリプト、表と機械語の生成プログラム(`tools/gen`) |
 | `udev/` | udev ルール |
 

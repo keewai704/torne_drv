@@ -122,6 +122,7 @@ Only x86-64 was checked; ARM was not. Please report problems with other kernels 
 | `driver/` | the kernel module (`torne_kern.c`), the OS-independent core (`torne_bridge.c`, `torne_dib.c`, `torne_card.c`), px4_drv's character device layer |
 | `ifd/` | the pcscd reader driver for the card slot |
 | `packaging/` | the script that builds the Debian packages |
+| `receiver/` | `torne-receiver`, a persistent process that drives the same core through libusb and serves tuning and the card slot over Unix sockets; `ifd/` connects to its card socket |
 | `tools/` | `torne_user` (the same core run from user space with libusb), test scripts, and the generators for the tables and machine code (`tools/gen`) |
 | `udev/` | udev rules |
 
