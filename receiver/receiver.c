@@ -279,27 +279,6 @@ static int start_capture(struct receiver *receiver, int owner, uint32_t channel,
     return result;
 }
 
-static int receiver_status(struct receiver *receiver, struct torne_reply *reply)
-{
-    if (!receiver->channel)
-        return 0;
-    struct torne_dib_status status;
-    pthread_mutex_lock(&receiver->lock);
-    int result = torne_dib_status(&receiver->dib, &status);
-    torne_bridge_flush(&receiver->bridge);
-    if (receiver->bridge.err) {
-        fputs("USB status failed; restarting receiver\n", stderr);
-        exit(1);
-    }
-    pthread_mutex_unlock(&receiver->lock);
-    if (result)
-        return result;
-    reply->locked = status.locked;
-    reply->cnr_x100 = status.has_cnr ? status.cnr_x100 : 0;
-    reply->strength_dbm_x1000 = status.has_strength ? status.strength_dbm_x1000 : 0;
-    return 0;
-}
-
 static int usb_path(libusb_device *device, char *path, size_t capacity)
 {
     uint8_t ports[8];
@@ -421,10 +400,6 @@ static int daemon_main(const char *device, const char *directory)
                     reply.result = -EPROTO;
                 } else if (request.command == TORNE_COMMAND_TUNE) {
                     reply.result = start_capture(&receiver, owner, request.channel, request.tsid, &stream);
-                } else if (request.command == TORNE_COMMAND_STATUS) {
-                    reply.result = receiver_status(&receiver, &reply);
-                } else if (request.command == TORNE_COMMAND_STOP) {
-                    stop_capture(&receiver);
                 } else {
                     reply.result = -EINVAL;
                 }

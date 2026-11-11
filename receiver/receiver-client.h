@@ -12,8 +12,6 @@
 
 #define TORNE_PROTOCOL_VERSION 1
 #define TORNE_COMMAND_TUNE 1
-#define TORNE_COMMAND_STATUS 2
-#define TORNE_COMMAND_STOP 3
 
 struct torne_request {
     uint32_t version;
@@ -24,9 +22,6 @@ struct torne_request {
 
 struct torne_reply {
     int32_t result;
-    uint32_t locked;
-    int32_t cnr_x100;
-    int32_t strength_dbm_x1000;
 };
 
 static inline int torne_send_reply(int fd, const struct torne_reply *reply, int stream)
